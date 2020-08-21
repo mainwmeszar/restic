@@ -19,11 +19,9 @@ package minio
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
-	"strings"
 
 	"github.com/minio/minio-go/v6/pkg/s3utils"
 )
@@ -39,8 +37,23 @@ import (
 //   }
 //
 func (c Client) ListBuckets() ([]BucketInfo, error) {
+	return c.ListBucketsWithContext(context.Background())
+}
+
+// ListBucketsWithContext list all buckets owned by this authenticated user,
+// accepts a context for facilitate cancellation.
+//
+// This call requires explicit authentication, no anonymous requests are
+// allowed for listing buckets.
+//
+//   api := client.New(....)
+//   for message := range api.ListBucketsWithContext(context.Background()) {
+//       fmt.Println(message)
+//   }
+//
+func (c Client) ListBucketsWithContext(ctx context.Context) ([]BucketInfo, error) {
 	// Execute GET on service.
-	resp, err := c.executeMethod(context.Background(), "GET", requestMetadata{contentSHA256Hex: emptySHA256Hex})
+	resp, err := c.executeMethod(ctx, "GET", requestMetadata{contentSHA256Hex: emptySHA256Hex})
 	defer closeResponse(resp)
 	if err != nil {
 		return nil, err
@@ -88,6 +101,12 @@ func (c Client) ListBuckets() ([]BucketInfo, error) {
 //
 func (c Client) ListObjectsV2WithMetadata(bucketName, objectPrefix string, recursive bool,
 	doneCh <-chan struct{}) <-chan ObjectInfo {
+	// Check whether this is snowball region, if yes ListObjectsV2 doesn't work, fallback to listObjectsV1.
+	if location, ok := c.bucketLocCache.Get(bucketName); ok {
+		if location == "snowball" {
+			return c.ListObjects(bucketName, objectPrefix, recursive, doneCh)
+		}
+	}
 	return c.listObjectsV2(bucketName, objectPrefix, recursive, true, doneCh)
 }
 
@@ -140,6 +159,7 @@ func (c Client) listObjectsV2(bucketName, objectPrefix string, recursive, metada
 
 			// If contents are available loop through and send over channel.
 			for _, object := range result.Contents {
+				object.ETag = trimEtag(object.ETag)
 				select {
 				// Send object content.
 				case objectStatCh <- object:
@@ -196,6 +216,12 @@ func (c Client) listObjectsV2(bucketName, objectPrefix string, recursive, metada
 //   }
 //
 func (c Client) ListObjectsV2(bucketName, objectPrefix string, recursive bool, doneCh <-chan struct{}) <-chan ObjectInfo {
+	// Check whether this is snowball region, if yes ListObjectsV2 doesn't work, fallback to listObjectsV1.
+	if location, ok := c.bucketLocCache.Get(bucketName); ok {
+		if location == "snowball" {
+			return c.ListObjects(bucketName, objectPrefix, recursive, doneCh)
+		}
+	}
 	return c.listObjectsV2(bucketName, objectPrefix, recursive, false, doneCh)
 }
 
@@ -234,10 +260,14 @@ func (c Client) listObjectsV2Query(bucketName, objectPrefix, continuationToken s
 	urlValues.Set("encoding-type", "url")
 
 	// Set object prefix, prefix value to be set to empty is okay.
-	urlValues.Set("prefix", objectPrefix)
+	if objectPrefix != "" {
+		urlValues.Set("prefix", objectPrefix)
+	}
 
 	// Set delimiter, delimiter value to be set to empty is okay.
-	urlValues.Set("delimiter", delimiter)
+	if delimiter != "" {
+		urlValues.Set("delimiter", delimiter)
+	}
 
 	// Set continuation token
 	if continuationToken != "" {
@@ -284,18 +314,21 @@ func (c Client) listObjectsV2Query(bucketName, objectPrefix, continuationToken s
 	// This is an additional verification check to make
 	// sure proper responses are received.
 	if listBucketResult.IsTruncated && listBucketResult.NextContinuationToken == "" {
-		return listBucketResult, errors.New("Truncated response should have continuation token set")
+		return listBucketResult, ErrorResponse{
+			Code:    "NotImplemented",
+			Message: "Truncated response should have continuation token set",
+		}
 	}
 
 	for i, obj := range listBucketResult.Contents {
-		listBucketResult.Contents[i].Key, err = url.QueryUnescape(obj.Key)
+		listBucketResult.Contents[i].Key, err = decodeS3Name(obj.Key, listBucketResult.EncodingType)
 		if err != nil {
 			return listBucketResult, err
 		}
 	}
 
 	for i, obj := range listBucketResult.CommonPrefixes {
-		listBucketResult.CommonPrefixes[i].Prefix, err = url.QueryUnescape(obj.Prefix)
+		listBucketResult.CommonPrefixes[i].Prefix, err = decodeS3Name(obj.Prefix, listBucketResult.EncodingType)
 		if err != nil {
 			return listBucketResult, err
 		}
@@ -430,10 +463,14 @@ func (c Client) listObjectsQuery(bucketName, objectPrefix, objectMarker, delimit
 	urlValues := make(url.Values)
 
 	// Set object prefix, prefix value to be set to empty is okay.
-	urlValues.Set("prefix", objectPrefix)
+	if objectPrefix != "" {
+		urlValues.Set("prefix", objectPrefix)
+	}
 
 	// Set delimiter, delimiter value to be set to empty is okay.
-	urlValues.Set("delimiter", delimiter)
+	if delimiter != "" {
+		urlValues.Set("delimiter", delimiter)
+	}
 
 	// Set object marker.
 	if objectMarker != "" {
@@ -471,21 +508,21 @@ func (c Client) listObjectsQuery(bucketName, objectPrefix, objectMarker, delimit
 	}
 
 	for i, obj := range listBucketResult.Contents {
-		listBucketResult.Contents[i].Key, err = url.QueryUnescape(obj.Key)
+		listBucketResult.Contents[i].Key, err = decodeS3Name(obj.Key, listBucketResult.EncodingType)
 		if err != nil {
 			return listBucketResult, err
 		}
 	}
 
 	for i, obj := range listBucketResult.CommonPrefixes {
-		listBucketResult.CommonPrefixes[i].Prefix, err = url.QueryUnescape(obj.Prefix)
+		listBucketResult.CommonPrefixes[i].Prefix, err = decodeS3Name(obj.Prefix, listBucketResult.EncodingType)
 		if err != nil {
 			return listBucketResult, err
 		}
 	}
 
 	if listBucketResult.NextMarker != "" {
-		listBucketResult.NextMarker, err = url.QueryUnescape(listBucketResult.NextMarker)
+		listBucketResult.NextMarker, err = decodeS3Name(listBucketResult.NextMarker, listBucketResult.EncodingType)
 		if err != nil {
 			return listBucketResult, err
 		}
@@ -632,10 +669,14 @@ func (c Client) listMultipartUploadsQuery(bucketName, keyMarker, uploadIDMarker,
 	}
 
 	// Set object prefix, prefix value to be set to empty is okay.
-	urlValues.Set("prefix", prefix)
+	if prefix != "" {
+		urlValues.Set("prefix", prefix)
+	}
 
 	// Set delimiter, delimiter value to be set to empty is okay.
-	urlValues.Set("delimiter", delimiter)
+	if delimiter != "" {
+		urlValues.Set("delimiter", delimiter)
+	}
 
 	// Always set encoding-type
 	urlValues.Set("encoding-type", "url")
@@ -668,25 +709,25 @@ func (c Client) listMultipartUploadsQuery(bucketName, keyMarker, uploadIDMarker,
 		return listMultipartUploadsResult, err
 	}
 
-	listMultipartUploadsResult.NextKeyMarker, err = url.QueryUnescape(listMultipartUploadsResult.NextKeyMarker)
+	listMultipartUploadsResult.NextKeyMarker, err = decodeS3Name(listMultipartUploadsResult.NextKeyMarker, listMultipartUploadsResult.EncodingType)
 	if err != nil {
 		return listMultipartUploadsResult, err
 	}
 
-	listMultipartUploadsResult.NextUploadIDMarker, err = url.QueryUnescape(listMultipartUploadsResult.NextUploadIDMarker)
+	listMultipartUploadsResult.NextUploadIDMarker, err = decodeS3Name(listMultipartUploadsResult.NextUploadIDMarker, listMultipartUploadsResult.EncodingType)
 	if err != nil {
 		return listMultipartUploadsResult, err
 	}
 
 	for i, obj := range listMultipartUploadsResult.Uploads {
-		listMultipartUploadsResult.Uploads[i].Key, err = url.QueryUnescape(obj.Key)
+		listMultipartUploadsResult.Uploads[i].Key, err = decodeS3Name(obj.Key, listMultipartUploadsResult.EncodingType)
 		if err != nil {
 			return listMultipartUploadsResult, err
 		}
 	}
 
 	for i, obj := range listMultipartUploadsResult.CommonPrefixes {
-		listMultipartUploadsResult.CommonPrefixes[i].Prefix, err = url.QueryUnescape(obj.Prefix)
+		listMultipartUploadsResult.CommonPrefixes[i].Prefix, err = decodeS3Name(obj.Prefix, listMultipartUploadsResult.EncodingType)
 		if err != nil {
 			return listMultipartUploadsResult, err
 		}
@@ -709,8 +750,7 @@ func (c Client) listObjectParts(bucketName, objectName, uploadID string) (partsI
 		// Append to parts info.
 		for _, part := range listObjPartsResult.ObjectParts {
 			// Trim off the odd double quotes from ETag in the beginning and end.
-			part.ETag = strings.TrimPrefix(part.ETag, "\"")
-			part.ETag = strings.TrimSuffix(part.ETag, "\"")
+			part.ETag = trimEtag(part.ETag)
 			partsInfo[part.PartNumber] = part
 		}
 		// Keep part number marker, for the next iteration.
@@ -808,4 +848,14 @@ func (c Client) listObjectPartsQuery(bucketName, objectName, uploadID string, pa
 		return listObjectPartsResult, err
 	}
 	return listObjectPartsResult, nil
+}
+
+// Decode an S3 object name according to the encoding type
+func decodeS3Name(name, encodingType string) (string, error) {
+	switch encodingType {
+	case "url":
+		return url.QueryUnescape(name)
+	default:
+		return name, nil
+	}
 }
